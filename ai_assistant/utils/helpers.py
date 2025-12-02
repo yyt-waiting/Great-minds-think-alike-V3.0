@@ -1,19 +1,14 @@
 # ai_assistant/utils/helpers.py
 
 import re
-from typing import Tuple
 import json
+from typing import Tuple
 from datetime import datetime
+from . import config
 
 def extract_emotion_type(analysis_text: str) -> str:
     """
     从分析文本中提取情感类型（如开心、沮丧、专注等）。
-    
-    Args:
-        analysis_text (str): AI模型返回的完整分析文本。
-
-    Returns:
-        str: 匹配到的情感类型字符串，未匹配到则返回 "未知"。
     """
     emotion_keywords = {
         "开心": ["开心", "微笑", "愉悦", "兴奋"],
@@ -32,59 +27,32 @@ def extract_emotion_type(analysis_text: str) -> str:
 def extract_language_emotion_content(text: str) -> str:
     """
     从ASR（语音识别）的原始输出中提取干净的对话内容。
-    使用正则表达式，比简单的字符串查找更健壮。
-    
-    Args:
-        text (str): ASR模型返回的带标签的文本，例如 "<|zh|> <|Happy|> 你好世界。"
-
-    Returns:
-        str: 清理后的纯文本，例如 "你好世界。"
     """
-    # 匹配最后一个 > 符号之后的所有非 > 字符
     match = re.search(r'>\s*([^>]*)$', text)
     if match:
-        # group(1) 获取第一个捕获组的内容
         return match.group(1).strip()
-    # 如果没有匹配到格式，则返回原始文本（做安全兜底）
     return text.strip()
 
 def log_observation_to_file(observation: dict):
     """
     将单条观察记录以JSON格式追加到每日日志文件中。
-    文件名会根据日期自动创建，例如 'observation_log_2023-10-27.jsonl'
     """
-    # 将datetime对象转换为ISO格式的字符串，方便之后读取
     if 'timestamp' in observation and isinstance(observation['timestamp'], datetime):
         observation['timestamp'] = observation['timestamp'].isoformat()
         
-    # 获取当天的日期作为文件名的一部分
     today_str = datetime.now().strftime('%Y-%m-%d')
     log_file_path = f'observation_log_{today_str}.jsonl'
     
     try:
-        # 使用 'a' (append) 模式，将记录作为新的一行追加到文件末尾
         with open(log_file_path, 'a', encoding='utf-8') as f:
-            # json.dumps将字典转换为JSON字符串
-            # ensure_ascii=False 确保中文字符能被正确写入
             f.write(json.dumps(observation, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"写入观察日志文件时出错: {e}")
 
-
-
 def extract_behavior_type(analysis_text: str) -> Tuple[str, str]:
     """
     从AI分析文本中提取行为类型编号和描述。
-    
-    Args:
-        analysis_text (str): AI模型返回的完整分析文本。
-
-    Returns:
-        tuple[str, str]: 一个包含 (行为编号, 行为描述) 的元组。
-                         未识别则返回 ("0", "未识别")。
     """
-    # 优先模式: 匹配 "数字" + "可选分隔符" + "明确的行为描述"
-    #正则表达式（Regular Expression） 来从文本中提取特定格式的信息
     pattern = r'(\d+)\s*[.、:]?\s*(认真专注工作|吃东西|用杯子喝水|喝饮料|玩手机|睡觉|其他)'
     match = re.search(pattern, analysis_text)
     
@@ -93,7 +61,6 @@ def extract_behavior_type(analysis_text: str) -> Tuple[str, str]:
         behavior_desc = match.group(2)
         return behavior_num, behavior_desc
     
-    # 兜底模式: 如果上面的精确模式匹配失败，尝试只匹配行为关键词
     fallback_patterns = [
         ('认真专注工作', '1'),
         ('吃东西', '2'),
@@ -110,6 +77,92 @@ def extract_behavior_type(analysis_text: str) -> Tuple[str, str]:
             
     return "0", "未识别"
 
+# ==========================================
+# Phase 1.1 新增函数 (必须顶格写，不能缩进)
+# ==========================================
+def parse_model_response(response_text: str) -> dict:
 
 
     
+    """
+    解析 Qwen-VL 返回的 JSON 数据。
+    这是连接感知（API）和决策（代码逻辑）的关键桥梁。
+    """
+    try:
+        # 1. 清洗数据
+        cleaned_text = re.sub(r'```json\s*|\s*```', '', response_text).strip()
+        if cleaned_text.lower().startswith("json"):
+            cleaned_text = cleaned_text[4:].strip()
+        
+        # 2. 解析 JSON
+        data = json.loads(cleaned_text)
+        
+        # 3. 数据完整性兜底
+        if "emotions" not in data:
+            data["emotions"] = config.DEFAULT_EMOTION_VECTOR
+            
+        if "behavior" not in data:
+            data["behavior"] = {"id": "0", "description": "未知行为"}
+            
+        return data
+
+    except Exception as e:
+        print(f"解析 JSON 失败: {e} | 原始返回: {response_text[:50]}...")
+        # 返回安全结构
+        return {
+            "behavior": {"id": "0", "description": "识别错误"},
+            "emotions": config.DEFAULT_EMOTION_VECTOR,
+            "analysis": "视觉分析数据解析失败"
+        }
+
+
+
+
+# ======================================================
+# Phase 3.3 安全熔断机制
+# ======================================================
+
+# 危机关键词库 (可扩展)
+CRISIS_KEYWORDS = [
+    "不想活", "自杀", "去死", "结束生命", "毫无意义", 
+    "绝望", "毁灭", "割腕", "跳楼", "遗书"
+]
+
+
+
+#我当然不会哈哈！是指用户啦，当然我觉得有些貌似不太吉利？
+# 危机干预硬编码回复 (不经过 LLM，确保绝对安全)
+CRISIS_RESPONSE = """
+我听到了你内心极其痛苦的声音。
+请立刻停下来，深呼吸。你现在处于非常危险的情绪风暴中，但请相信这只是暂时的。
+我恳请你立刻寻求专业帮助：
+1. 请拨打心理援助热线：400-161-9995
+2. 或者联系你最信任的朋友/家人。
+我一直在这里陪着你，直到风暴过去。
+"""
+
+def check_safety_fuse(text: str) -> bool:
+    """
+    [安全熔断] 检测文本中是否包含危机关键词。
+    Returns: True 表示触发熔断（危险），False 表示安全。
+    """
+    if not text:
+        return False
+        
+    for kw in CRISIS_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+
+
+
+
+
+
+
+
+
+
+
+

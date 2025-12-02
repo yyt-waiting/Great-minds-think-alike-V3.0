@@ -66,16 +66,34 @@ class BehaviorVisualizationApp(ctk.CTk):
 
 
 
+# [Phase 1.5 兼容性修复] 增加参数以匹配 WebcamHandler 的新调用标准
+# ai_assistant/apps/behavior_visualizer_app.py
+
     def handle_analysis_result(self, timestamp: datetime, analysis_text: str, 
                                behavior_num: str, behavior_desc: str, 
-                               emotion: str, screenshot: Image.Image):
+                               emotion: str, screenshot: Image.Image,
+                               complex_emotion: str = None, 
+                               emotion_vector: dict = None): # 确保参数在这里
         """
-        这是来自WebcamHandler的回调函数，用于处理分析结果。
-        它是连接核心逻辑和UI的桥梁。
+        回调函数：处理分析结果
         """
-        # 在主线程中安全地更新UI
-        self.update_status(f"最新检测: {behavior_desc} (情绪: {emotion})")
+        # 1. 更新状态栏文字
+        status_text = f"最新检测: {behavior_desc} | 表面情绪: {emotion}"
+        if complex_emotion:
+             status_text += f" | 深度状态: {complex_emotion}"
+        self.update_status(status_text)
+        
+        # 2. 更新左侧行为图
         self.behavior_visualizer.add_behavior_data(timestamp, behavior_num)
+        
+        # 3. [Phase 2 新增] 更新右侧雷达图
+        # 如果有 emotion_vector，就传给 visualizer
+        if emotion_vector:
+            self.behavior_visualizer.update_emotion_data(emotion_vector)
+
+
+
+
 
     def update_status(self, text: str):
         """更新UI上的状态标签。"""

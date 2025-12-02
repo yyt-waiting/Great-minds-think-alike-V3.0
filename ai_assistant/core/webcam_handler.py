@@ -7,12 +7,18 @@ from PIL import Image
 from datetime import datetime
 import logging
 import oss2
+import json
+
 
 # 从我们自己的包里导入所需模块
 from ai_assistant.core.api_clients import qwen_client, oss_bucket
 from ai_assistant.utils.helpers import extract_behavior_type, extract_emotion_type
+#这个导入可能是不需要的！需要注意删除
 from ai_assistant.ui.camera_window import CameraWindow
 from ai_assistant.utils import config
+from ai_assistant.core.emotion_engine import EmotionEngine
+
+from ai_assistant.utils.helpers import parse_model_response
 
 class WebcamHandler:
     """
@@ -33,6 +39,8 @@ class WebcamHandler:
         self.webcam_thread = None
         self.last_webcam_image = None
         self.camera_window = None
+        # [Phase 1.2 新增] 初始化情感引擎
+        self.emotion_engine = EmotionEngine()
 
     def start(self) -> bool:
         """启动摄像头捕获进程，并开始后台分析循环。"""
@@ -114,6 +122,12 @@ class WebcamHandler:
             analysis_thread.daemon = True
             analysis_thread.start()
 
+
+
+
+
+# ai_assistant/core/webcam_handler.py
+
     def _capture_and_analyze_pipeline(self):
         """[分析线程] 执行完整的“捕获->上传->分析->回调”流程。"""
         self.processing = True
@@ -129,40 +143,66 @@ class WebcamHandler:
                 raise ValueError("上传截图失败")
 
             self.app.update_status("正在分析图像...")
-            analysis_text = self._get_image_analysis(screenshot_urls)
-            if not analysis_text:
+            
+            # 1. 获取并解析 AI 原始数据
+            raw_response = self._get_image_analysis(screenshot_urls)
+            if not raw_response:
                 raise ValueError("图像分析返回空结果")
-
-            # 从分析结果中提取结构化数据
-            behavior_num, behavior_desc = extract_behavior_type(analysis_text)
-            emotion = extract_emotion_type(analysis_text)
             
-            # 记录到日志文件
+            # 引入解析器 (防止未导入报错)
+            from ai_assistant.utils.helpers import parse_model_response
+            parsed_data = parse_model_response(raw_response)
+            
+            # 2. 提取基础信息
+            behavior_info = parsed_data.get("behavior", {})
+            behavior_num = str(behavior_info.get("id", "0"))
+            behavior_desc = behavior_info.get("description", "未识别")
+            analysis_text = parsed_data.get("analysis", "无详细分析")
+            
+            # 3. [关键修正] 注入情感引擎 (Academic Engine Upgrade)
+            raw_emotion_vector = parsed_data.get("emotions", config.DEFAULT_EMOTION_VECTOR)
+            
+            # A. 更新引擎内部状态 (EMA 平滑)
+            self.emotion_engine.update(raw_emotion_vector)
+            
+            # B. 计算复合情绪 (使用新方法名: compute_complex_emotions)
+            # 旧代码调用的是 get_complex_label，这里必须改！
+            complex_label = self.emotion_engine.compute_complex_emotions()
+            
+            # C. 获取 UI 情绪 (使用新方法名: get_ui_emotion_by_similarity)
+            # 旧代码是查表，现在是计算余弦相似度
+            ui_emotion = self.emotion_engine.get_ui_emotion_by_similarity()
+            
+            # D. 获取用于日志的字典数据
+            smoothed_vector_dict = self.emotion_engine.get_current_state_dict()
+
+            # 4. 日志记录
             timestamp = datetime.now()
-            log_message = f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} - BEHAVIOR: {behavior_desc} ({behavior_num}) - EMOTION: {emotion} - DETAIL: {analysis_text}"
-            logging.info(log_message)
+            log_msg = f"ANALYSIS | 行为:{behavior_desc} | UI:{ui_emotion} | 复合:{complex_label} | 向量:{json.dumps(smoothed_vector_dict, ensure_ascii=False)}"
+            logging.info(log_msg)
             
-            # *** 关键一步：通过回调函数将结果传递给主应用 ***
-            # WebcamHandler不关心结果如何被使用，它只负责产生结果。~！！！！！！！！！！！！！！
-
+            # 5. 回调主应用
             self.app.handle_analysis_result(
-                timestamp, analysis_text, behavior_num, behavior_desc, 
-                emotion, current_screenshot
+                timestamp, 
+                analysis_text, 
+                behavior_num, 
+                behavior_desc, 
+                ui_emotion, 
+                current_screenshot,
+                complex_emotion=complex_label, # 传参
+                emotion_vector=smoothed_vector_dict # 传参
             )
 
         except Exception as e:
             error_msg = f"捕获与分析流程出错: {e}"
             print(error_msg)
+            import traceback
+            traceback.print_exc() # 打印详细报错方便调试
             self.app.update_status(error_msg)
         finally:
-            # 无论成功或失败，都必须重置processing状态并安排下一次捕获
             self.processing = False
-            # 使用 self.app.after 在主线程中安全地调度下一次任务
-            # 10000毫秒 = 10秒，控制API调用频率
-            # 将秒转换为毫秒给 after 方法使用
             delay_ms = int(config.ANALYSIS_INTERVAL_SECONDS * 1000)
             self.app.after(delay_ms, self.trigger_next_capture)
-
 
 
 
@@ -209,13 +249,23 @@ class WebcamHandler:
 
     def _get_image_analysis(self, image_urls: list) -> str:
         """[分析线程] 调用Qwen-VL API分析图像，同时获取行为和情感。"""
+        # 定义严格的输出结构
+        json_template = {
+            "behavior": {"id": "行为编号(1-7)", "description": "描述"},
+            "emotions": {k: "0-10分" for k in config.PLUTCHIK_EMOTIONS}, # 动态引用配置
+            "analysis": "简短的心理学观察总结(50字内)"
+        }
+
         system_prompt = (
-            "详细观察这个人的行为和面部情感和表情。行为需判断为：1.认真专注工作, 2.吃东西, "
-            "3.用杯子喝水, 4.喝饮料, 5.玩手机, 6.睡觉, 7.其他。情感需判断为：开心、"
-            "沮丧、专注、疲惫、生气、平静等常见情绪,其中重点要检测用户的负面情绪。分析时结合表情（如皱眉、微笑）、"
-            "姿势和环境，用中文明确指出行为类型（带编号）和情感类型。"
+            "你是一个基于情感计算理论的数字生命观察员。请分析画面。\n"
+            "理论基础：Robert Plutchik 情感轮。\n"
+            "任务：\n"
+            "1. 判断行为：1.认真专注工作, 2.吃东西, 3.用杯子喝水, 4.喝饮料, 5.玩手机, 6.睡觉, 7.其他。\n"
+            "2. 量化情绪：为8个Plutchik基础维度打分(0-10)。\n"
+            "3. 格式要求：仅输出标准 JSON 字符串，无 Markdown 标记。"
         )
-        user_prompt = "这个人正在做什么？情绪又是如何的？请详细描述观察内容，并明确给出行为编号和情感结果。"
+        
+        user_prompt = f"分析画面并严格按此JSON格式返回：{json.dumps(json_template, ensure_ascii=False)}"
         
         messages = [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},

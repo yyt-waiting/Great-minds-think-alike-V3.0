@@ -36,3 +36,8 @@ httpx
 
 # --- Optional for Development ---
 keyboard
+
+
+#------------------------------
+pandas
+seaborn
